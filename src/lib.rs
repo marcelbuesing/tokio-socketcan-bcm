@@ -80,6 +80,7 @@ use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
 use std::{io, slice, time};
+use socketcan::EFF_FLAG;
 use tokio::reactor::PollEvented2;
 
 // reexport socketcan CANFrame
@@ -87,6 +88,19 @@ pub use socketcan::CANFrame;
 
 #[cfg(feature = "try_from")]
 use socketcan::{SFF_MASK, EFF_MASK};
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::convert::TryFrom;
+
+    #[test]
+    fn eff_with_eff_bit_is_stripped_of_bit() {
+        let can_id = CANMessageId::try_from(0x98FE_F5EBu32);
+        assert_eq!(Ok(CANMessageId::EFF(0x18FE_F5EB)), can_id);
+    }
+}
 
 /// defined in socket.h
 pub const AF_CAN: c_int = 29;
@@ -766,7 +780,15 @@ impl TryFrom<u32> for CANMessageId {
         match id {
             0...SFF_MASK => Ok(CANMessageId::SFF(id as u16)),
             SFF_MASK...EFF_MASK => Ok(CANMessageId::EFF(id)),
-            _ => Err(ConstructionError::IDTooLarge),
+            _ => {
+                // might be the EFF flag is set
+                if id & EFF_FLAG != 0 {
+                    let without_flag = id & EFF_MASK;
+                    Ok(CANMessageId::EFF(without_flag))
+                } else {
+                    Err(ConstructionError::IDTooLarge)
+                }
+            },
         }
     }
 }
@@ -780,7 +802,7 @@ impl From<CANMessageId> for u32 {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 /// Error that occurs when creating CAN packets
 pub enum ConstructionError {
     /// CAN ID was outside the range of valid IDs
