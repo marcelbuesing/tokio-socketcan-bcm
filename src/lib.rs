@@ -80,6 +80,7 @@ use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
 use std::{io, slice, time};
+#[cfg(feature = "try_from")]
 use socketcan::EFF_FLAG;
 use tokio::reactor::PollEvented2;
 
@@ -249,53 +250,6 @@ pub struct TxMsg {
     _frames: [CANFrame; MAX_NFRAMES as usize],
 }
 
-#[derive(Debug)]
-/// Errors opening socket
-pub enum CANBCMSocketOpenError {
-    /// Device could not be found
-    LookupError(nix::Error),
-
-    /// System error while trying to look up device name
-    IOError(io::Error),
-}
-
-impl fmt::Display for CANBCMSocketOpenError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            CANBCMSocketOpenError::LookupError(ref e) => write!(f, "CAN Device not found: {}", e),
-            CANBCMSocketOpenError::IOError(ref e) => write!(f, "IO: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for CANBCMSocketOpenError {
-    fn description(&self) -> &str {
-        match *self {
-            CANBCMSocketOpenError::LookupError(_) => "can device not found",
-            CANBCMSocketOpenError::IOError(ref e) => e.description(),
-        }
-    }
-
-    fn cause(&self) -> Option<&std::error::Error> {
-        match *self {
-            CANBCMSocketOpenError::LookupError(ref e) => Some(e),
-            CANBCMSocketOpenError::IOError(ref e) => Some(e),
-        }
-    }
-}
-
-impl From<nix::Error> for CANBCMSocketOpenError {
-    fn from(e: nix::Error) -> CANBCMSocketOpenError {
-        CANBCMSocketOpenError::LookupError(e)
-    }
-}
-
-impl From<io::Error> for CANBCMSocketOpenError {
-    fn from(e: io::Error) -> CANBCMSocketOpenError {
-        CANBCMSocketOpenError::IOError(e)
-    }
-}
-
 /// A socket for a CAN device, specifically for broadcast manager operations.
 #[derive(Debug)]
 pub struct BCMSocket {
@@ -390,15 +344,21 @@ impl BCMSocket {
     ///
     /// Usually the more common case, opens a socket can device by name, such
     /// as "vcan0" or "socan0".
-    pub fn open_nb(ifname: &str) -> Result<BCMSocket, CANBCMSocketOpenError> {
-        let if_index = if_nametoindex(ifname)?;
+    pub fn open_nb(ifname: &str) -> io::Result<BCMSocket> {
+        let if_index = if_nametoindex(ifname).map_err(|nix_error|{
+            if let nix::Error::Sys(err_no) = nix_error {
+                    io::Error::from(err_no)
+                } else {
+                    panic!("unexpected nix error type: {:?}", nix_error)
+            }
+        })?;
         BCMSocket::open_if_nb(if_index)
     }
 
     /// Open CAN device by interface number non blocking.
     ///
     /// Opens a CAN device by kernel interface number.
-    pub fn open_if_nb(if_index: c_uint) -> Result<BCMSocket, CANBCMSocketOpenError> {
+    pub fn open_if_nb(if_index: c_uint) -> io::Result<BCMSocket> {
         // open socket
         let sock_fd;
         unsafe {
@@ -406,13 +366,13 @@ impl BCMSocket {
         }
 
         if sock_fd == -1 {
-            return Err(CANBCMSocketOpenError::from(io::Error::last_os_error()));
+            return Err(io::Error::last_os_error());
         }
 
         let fcntl_resp = unsafe { fcntl(sock_fd, F_SETFL, O_NONBLOCK) };
 
         if fcntl_resp == -1 {
-            return Err(CANBCMSocketOpenError::from(io::Error::last_os_error()));
+            return Err(io::Error::last_os_error());
         }
 
         let addr = CANAddr {
@@ -434,7 +394,7 @@ impl BCMSocket {
         }
 
         if connect_res != 0 {
-            return Err(CANBCMSocketOpenError::from(io::Error::last_os_error()));
+            return Err(io::Error::last_os_error());
         }
 
         Ok(BCMSocket { fd: sock_fd })
