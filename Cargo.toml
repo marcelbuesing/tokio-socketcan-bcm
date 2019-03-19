@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-bcm"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["marcelbuesing <buesing.marcel@googlemail.com>"]
 license = "MIT"
 description = "Asynchronous Linux SocketCAN - Broadcast Manager support (BCM) with tokio"
