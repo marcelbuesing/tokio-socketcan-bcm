@@ -12,52 +12,26 @@
 
 This crate would not have been possible without the [socketcan crate](https://github.com/mbr/socketcan-rs).
 
-# Example 1
+# Example
 
 ```Rust
-use futures::stream::Stream;
 use std::time;
 use tokio_socketcan_bcm::*;
-fn main() {
+use futures_util::stream::StreamExt;
+
+#[tokio::main]
+async fn main() {
     let socket = BCMSocket::open_nb("vcan0").unwrap();
-    // Throttle messages in kernel space to max every 5 seconds
-    let ival = time::Duration::from_secs(5);
-    let f = socket
+    let ival = time::Duration::from_millis(0);
+
+    // create a stream of messages that filters by the can frame id 0x123
+    let mut can_frame_stream = socket
         .filter_id_incoming_frames(0x123.into(), ival, ival)
-        .unwrap()
-        .map_err(|err| eprintln!("IO error {:?}", err))
-        .for_each(|frame| {
-            println!("Frame {:?}", frame);
-            Ok(())
-        });
-    tokio::run(f);
-}
-```
+        .unwrap();
 
-# Example 2 (async/await)
-Notice: async/await currently requires nightly rust and the tokio `async-await-preview` feature.
-
-```Rust
-#![feature(await_macro, async_await, futures_api)]
-#[macro_use]
-extern crate tokio;
-use std::time;
-use tokio::prelude::*;
-use tokio_socketcan_bcm::*;
-fn main() {
-    tokio::run_async(
-        async {
-            let socket = BCMSocket::open_nb("vcan0").unwrap();
-            let ival = time::Duration::from_millis(0);
-            // create a stream of messages that filters by the can frame id 0x123
-            let mut can_frame_stream = socket
-                .filter_id_incoming_frames(0x123.into(), ival, ival)
-                .unwrap();
-            while let Some(frame) = await!(can_frame_stream.next()) {
-                println!("Frame {:?}", frame);
-                ()
-            }
-        },
-    );
+    while let Some(frame) = can_frame_stream.next().await {
+        println!("Frame {:?}", frame);
+        ()
+    }
 }
 ```

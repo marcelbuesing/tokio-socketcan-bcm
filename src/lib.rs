@@ -66,29 +66,23 @@ use libc::{
 };
 
 use bitflags::bitflags;
-
-#[cfg(feature = "try_from")]
-use core::convert::TryFrom;
-use futures;
-use futures::try_ready;
-use futures::Stream;
+use futures::prelude::*;
+use futures::ready;
+use futures::task::Context;
+use mio::event::Evented;
 use mio::unix::EventedFd;
-use mio::{Evented, Poll, PollOpt, Ready, Token};
+use mio::{unix::UnixReady, PollOpt, Ready, Token};
 use nix::net::if_::if_nametoindex;
-use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
+use std::pin::Pin;
+use std::task::Poll;
 use std::{io, slice, time};
-#[cfg(feature = "try_from")]
-use socketcan::EFF_FLAG;
-use tokio::reactor::PollEvented2;
+use tokio::io::PollEvented;
 
 // reexport socketcan CANFrame
 pub use socketcan::CANFrame;
-
-#[cfg(feature = "try_from")]
-use socketcan::{SFF_MASK, EFF_MASK};
 
 #[cfg(test)]
 mod tests {
@@ -257,57 +251,43 @@ pub struct BCMSocket {
 }
 
 pub struct BcmFrameStream {
-    io: PollEvented2<BCMSocket>,
-    frame_buffer: VecDeque<CANFrame>,
+    io: PollEvented<BCMSocket>,
 }
 
 impl BcmFrameStream {
-    pub fn new(socket: BCMSocket) -> BcmFrameStream {
-        BcmFrameStream {
-            io: PollEvented2::new(socket),
-            frame_buffer: VecDeque::new(),
-        }
+    pub fn new(socket: BCMSocket) -> io::Result<BcmFrameStream> {
+        let io = PollEvented::new(socket)?;
+        Ok(BcmFrameStream { io })
     }
 }
 
 impl Stream for BcmFrameStream {
-    type Item = CANFrame;
-    type Error = io::Error;
+    type Item = io::Result<CANFrame>;
 
-    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let ready = Ready::readable();
 
-        // Buffer still contains frames
-        // after testing this it looks like the recv_msg will never contain
-        // more than one msg, therefore the buffer is basically never filled
-        if let Some(frame) = self.frame_buffer.pop_front() {
-            return Ok(futures::Async::Ready(Some(frame)));
-        }
-
-        try_ready!(self.io.poll_read_ready(ready));
+        ready!(self
+            .io
+            .poll_read_ready(cx, Ready::readable() | UnixReady::error()))?;
 
         match self.io.get_ref().read_msg() {
             Ok(n) => {
-                let mut frames = n.frames().to_vec();
-                if let Some(frame) = frames.pop() {
-                    if !frames.is_empty() {
-                        for frame in n.frames() {
-                            self.frame_buffer.push_back(*frame)
-                        }
-                    }
-                    Ok(futures::Async::Ready(Some(frame)))
+                if let Some(frame) = n.frames().iter().next() {
+                    Poll::Ready(Some(Ok(*frame)))
                 } else {
                     // This happens e.g. when a timed out msg is received
-                    self.io.clear_read_ready(ready)?;
-                    Ok(futures::Async::NotReady)
+                    self.io.clear_read_ready(cx, ready)?;
+                    Poll::Pending
                 }
             }
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(ready)?;
-                    return Ok(futures::Async::NotReady);
+            Err(err) => {
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    self.io.clear_read_ready(cx, ready)?;
+                    return Poll::Pending;
+                } else {
+                    Poll::Ready(Some(Err(err)))
                 }
-                Err(e)
             }
         }
     }
@@ -316,7 +296,7 @@ impl Stream for BcmFrameStream {
 impl Evented for BcmFrameStream {
     fn register(
         &self,
-        poll: &Poll,
+        poll: &mio::Poll,
         token: Token,
         interest: Ready,
         opts: PollOpt,
@@ -326,7 +306,7 @@ impl Evented for BcmFrameStream {
 
     fn reregister(
         &self,
-        poll: &Poll,
+        poll: &mio::Poll,
         token: Token,
         interest: Ready,
         opts: PollOpt,
@@ -334,7 +314,7 @@ impl Evented for BcmFrameStream {
         self.io.get_ref().reregister(poll, token, interest, opts)
     }
 
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
         self.io.get_ref().deregister(poll)
     }
 }
@@ -345,11 +325,11 @@ impl BCMSocket {
     /// Usually the more common case, opens a socket can device by name, such
     /// as "vcan0" or "socan0".
     pub fn open_nb(ifname: &str) -> io::Result<BCMSocket> {
-        let if_index = if_nametoindex(ifname).map_err(|nix_error|{
+        let if_index = if_nametoindex(ifname).map_err(|nix_error| {
             if let nix::Error::Sys(err_no) = nix_error {
-                    io::Error::from(err_no)
-                } else {
-                    panic!("unexpected nix error type: {:?}", nix_error)
+                io::Error::from(err_no)
+            } else {
+                panic!("unexpected nix error type: {:?}", nix_error)
             }
         })?;
         BCMSocket::open_if_nb(if_index)
@@ -479,7 +459,7 @@ impl BCMSocket {
         ival2: time::Duration,
     ) -> io::Result<BcmFrameStream> {
         self.filter_id(can_id, ival1, ival2)?;
-        Ok(self.incoming_frames())
+        self.incoming_frames()
     }
 
     ///
@@ -508,7 +488,7 @@ impl BCMSocket {
     /// tokio::run(f);
     /// ```
     ///
-    pub fn incoming_msg(self) -> BcmStream {
+    pub fn incoming_msg(self) -> io::Result<BcmStream> {
         BcmStream::from(self)
     }
 
@@ -538,7 +518,7 @@ impl BCMSocket {
     /// tokio::run(f);
     /// ```
     ///
-    pub fn incoming_frames(self) -> BcmFrameStream {
+    pub fn incoming_frames(self) -> io::Result<BcmFrameStream> {
         BcmFrameStream::new(self)
     }
 
@@ -604,7 +584,7 @@ impl BCMSocket {
 impl Evented for BCMSocket {
     fn register(
         &self,
-        poll: &Poll,
+        poll: &mio::Poll,
         token: Token,
         interest: Ready,
         opts: PollOpt,
@@ -614,7 +594,7 @@ impl Evented for BCMSocket {
 
     fn reregister(
         &self,
-        poll: &Poll,
+        poll: &mio::Poll,
         token: Token,
         interest: Ready,
         opts: PollOpt,
@@ -622,7 +602,7 @@ impl Evented for BCMSocket {
         EventedFd(&self.fd).reregister(poll, token, interest, opts)
     }
 
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
         EventedFd(&self.fd).deregister(poll)
     }
 }
@@ -634,7 +614,7 @@ impl Drop for BCMSocket {
 }
 
 pub struct BcmStream {
-    io: PollEvented2<BCMSocket>,
+    io: PollEvented<BCMSocket>,
 }
 
 pub trait IntoBcmStream {
@@ -645,29 +625,29 @@ pub trait IntoBcmStream {
 }
 
 impl BcmStream {
-    pub fn from(bcm_socket: BCMSocket) -> BcmStream {
-        let io = PollEvented2::new(bcm_socket);
-        BcmStream { io }
+    pub fn from(bcm_socket: BCMSocket) -> io::Result<BcmStream> {
+        let io = PollEvented::new(bcm_socket)?;
+        Ok(BcmStream { io })
     }
 }
 
 impl Stream for BcmStream {
-    type Item = BcmMsgHead;
-    type Error = io::Error;
+    type Item = io::Result<BcmMsgHead>;
 
-    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
-        let ready = Ready::readable();
-
-        try_ready!(self.io.poll_read_ready(ready));
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        ready!(self
+            .io
+            .poll_read_ready(cx, Ready::readable() | UnixReady::error()))?;
 
         match self.io.get_ref().read_msg() {
-            Ok(n) => Ok(futures::Async::Ready(Some(n))),
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(ready)?;
-                    return Ok(futures::Async::NotReady);
+            Ok(msg) => Poll::Ready(Some(Ok(msg))),
+            Err(err) => {
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    self.io.clear_read_ready(cx, Ready::readable())?;
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Some(Err(err)))
                 }
-                Err(e)
             }
         }
     }
@@ -726,8 +706,8 @@ impl CANMessageId {
 impl From<u16> for CANMessageId {
     fn from(id: u16) -> CANMessageId {
         match id {
-            0...SFF_MASK_U16 => CANMessageId::SFF(id),
-            SFF_MASK_U16...std::u16::MAX => CANMessageId::EFF(u32::from(id)),
+            0..=SFF_MASK_U16 => CANMessageId::SFF(id),
+            SFF_MASK_U16..=std::u16::MAX => CANMessageId::EFF(u32::from(id)),
         }
     }
 }
@@ -748,7 +728,7 @@ impl TryFrom<u32> for CANMessageId {
                 } else {
                     Err(ConstructionError::IDTooLarge)
                 }
-            },
+            }
         }
     }
 }

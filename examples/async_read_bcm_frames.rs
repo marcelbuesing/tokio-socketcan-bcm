@@ -1,19 +1,19 @@
-use futures::{Future, Stream};
+use futures_util::stream::StreamExt;
 use std::time;
-use std::io;
 use tokio_socketcan_bcm::*;
 
-fn main() -> io::Result<()> {
-    let socket = BCMSocket::open_nb("vcan0")?;
+#[tokio::main]
+async fn main() {
+    let socket = BCMSocket::open_nb("vcan0").unwrap();
     let ival = time::Duration::from_millis(0);
-    let f = socket
-        .filter_id_incoming_frames(0x123.into(), ival, ival)?
-        .for_each(|frame| {
-            println!("Frame {:?}", frame);
-            Ok(())
-        })
-        .map_err(|err| eprintln!("IO error {:?}", err));
-    tokio::run(f);
 
-    Ok(())
+    // create a stream of messages that filters by the can frame id 0x123
+    let mut can_frame_stream = socket
+        .filter_id_incoming_frames(0x123.into(), ival, ival)
+        .unwrap();
+
+    while let Some(frame) = can_frame_stream.next().await {
+        println!("Frame {:?}", frame);
+        ()
+    }
 }

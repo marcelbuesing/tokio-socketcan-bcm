@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-bcm"
-version = "0.2.0"
+version = "1.0.0"
 authors = ["marcelbuesing <buesing.marcel@googlemail.com>"]
 license = "MIT"
 description = "Asynchronous Linux SocketCAN - Broadcast Manager support (BCM) with tokio"
@@ -10,18 +10,11 @@ keywords = ["can", "socketcan", "bcm"]
 edition = "2018"
 
 [dependencies]
-bitflags = "1.0"
-futures = "0.1"
+bitflags = "1.2"
+futures = "0.3"
+futures-util = "0.3"
 libc = "0.2"
 mio = "0.6"
-nix = "0.13"
+nix = "0.18"
 socketcan = "1.7"
-tokio = {version = "0.1" }
-
-# [dependencies-dev]
-# tokio = {version = "0.1.16", features = ["async-await-preview"]}
-
-[features]
-# TryFrom<u32> for CANMessageId
-# https://github.com/rust-lang/rust/issues/33417
-try_from = []
+tokio = { version = "0.2", features = ["net", "macros"] }
