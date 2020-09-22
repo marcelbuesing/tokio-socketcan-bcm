@@ -6,57 +6,27 @@
 //! A BCM socket is not intended for sending individual CAN frames.
 //! To send invidiual frames use the [tokio-socketcan](https://crates.io/crates/tokio-socketcan) crate.
 //!
-//! # Example 1
-//! ```
-//! use futures::stream::Stream;
+//! # Example
+//!
+//! ```no_run
 //! use std::time;
 //! use tokio_socketcan_bcm::*;
+//! use futures_util::stream::StreamExt;
 //!
-//! fn main() {
+//! #[tokio::main]
+//! async fn main() {
 //!     let socket = BCMSocket::open_nb("vcan0").unwrap();
-//!     // Throttle messages in kernel space to max every 5 seconds
-//!     let ival = time::Duration::from_secs(5);
-//!     let f = socket
+//!     let ival = time::Duration::from_millis(0);
+//!
+//!     // create a stream of messages that filters by the can frame id 0x123
+//!     let mut can_frame_stream = socket
 //!         .filter_id_incoming_frames(0x123.into(), ival, ival)
-//!         .unwrap()
-//!         .map_err(|err| eprintln!("IO error {:?}", err))
-//!         .for_each(|frame| {
-//!             println!("Frame {:?}", frame);
-//!             Ok(())
-//!         });
-//!     tokio::run(f);
-//! }
-//! ```
+//!         .unwrap();
 //!
-//! # Example 2 (async/await)
-//! Notice: async/await currently requires nightly rust and the tokio `async-await-preview` feature.
-//! ```
-//! #![feature(await_macro, async_await, futures_api)]
-//!
-//! #[macro_use]
-//! extern crate tokio;
-//!
-//! use std::time;
-//! use tokio::prelude::*;
-//! use tokio_socketcan_bcm::*;
-//!
-//! fn main() {
-//!     tokio::run_async(
-//!         async {
-//!             let socket = BCMSocket::open_nb("vcan0").unwrap();
-//!             let ival = time::Duration::from_millis(0);
-//!
-//!             // create a stream of messages that filters by the can frame id 0x123
-//!             let mut can_frame_stream = socket
-//!                 .filter_id_incoming_frames(0x123.into(), ival, ival)
-//!                 .unwrap();
-//!
-//!             while let Some(frame) = await!(can_frame_stream.next()) {
-//!                 println!("Frame {:?}", frame);
-//!                 ()
-//!             }
-//!         },
-//!     );
+//!     while let Some(frame) = can_frame_stream.next().await {
+//!         println!("Frame {:?}", frame);
+//!         ()
+//!     }
 //! }
 //! ```
 
@@ -66,6 +36,7 @@ use libc::{
 };
 
 use bitflags::bitflags;
+use core::convert::TryFrom;
 use futures::prelude::*;
 use futures::ready;
 use futures::task::Context;
@@ -73,6 +44,7 @@ use mio::event::Evented;
 use mio::unix::EventedFd;
 use mio::{unix::UnixReady, PollOpt, Ready, Token};
 use nix::net::if_::if_nametoindex;
+use socketcan::{EFF_FLAG, EFF_MASK, SFF_MASK};
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
@@ -431,25 +403,26 @@ impl BCMSocket {
 
     ///
     /// Combination of `BCMSocket::filter_id` and `BCMSocket::incoming_frames`.
-    /// ```
-    /// extern crate futures;
-    /// extern crate tokio;
-    /// extern crate socketcan;
-    ///
-    /// use futures::stream::Stream;
-    /// use tokio::prelude::*;
+    /// ```no_run
     /// use std::time;
     /// use tokio_socketcan_bcm::*;
+    /// use futures_util::stream::StreamExt;
     ///
-    /// let ival = time::Duration::from_millis(1);
-    /// let socket = BCMSocket::open_nb("vcan0").unwrap();
-    /// let f = socket.filter_id_incoming_frames(0x123.into(), ival, ival).unwrap()
-    ///       .map_err(|_| ())
-    ///       .for_each(|frame| {
-    ///          println!("Frame {:?}", frame);
-    ///          Ok(())
-    ///        });
-    /// tokio::run(f);
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let socket = BCMSocket::open_nb("vcan0").unwrap();
+    ///     let ival = time::Duration::from_millis(0);
+    ///
+    ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let mut can_frame_stream = socket
+    ///         .filter_id_incoming_frames(0x123.into(), ival, ival)
+    ///         .unwrap();
+    ///
+    ///     while let Some(frame) = can_frame_stream.next().await {
+    ///         println!("Frame {:?}", frame);
+    ///         ()
+    ///     }
+    /// }
     /// ```
     ///
     pub fn filter_id_incoming_frames(
@@ -464,28 +437,26 @@ impl BCMSocket {
 
     ///
     /// Stream of incoming BcmMsgHeads that apply to the filter criteria.
-    /// ```
-    /// extern crate futures;
-    /// extern crate tokio;
-    /// extern crate socketcan;
-    ///
-    /// use futures::stream::Stream;
-    /// use tokio::prelude::*;
+    /// ```no_run
     /// use std::time;
     /// use tokio_socketcan_bcm::*;
+    /// use futures_util::stream::StreamExt;
     ///
-    /// let socket = BCMSocket::open_nb("vcan0").unwrap();
-    /// let ival = time::Duration::from_millis(1);
-    /// socket.filter_id(0x123.into(), ival, ival).unwrap();
-    /// let f = socket.incoming_msg()
-    ///        .map_err(|err| {
-    ///            eprintln!("IO error {:?}", err)
-    ///        })
-    ///       .for_each(|bcm_msg_head| {
-    ///          println!("BcmMsgHead {:?}", bcm_msg_head);
-    ///          Ok(())
-    ///        });
-    /// tokio::run(f);
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let socket = BCMSocket::open_nb("vcan0").unwrap();
+    ///     let ival = time::Duration::from_millis(0);
+    ///
+    ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let mut can_frame_stream = socket
+    ///         .incoming_msg()
+    ///         .unwrap();
+    ///
+    ///     while let Some(frame) = can_frame_stream.next().await {
+    ///         println!("Frame {:?}", frame);
+    ///         ()
+    ///     }
+    /// }
     /// ```
     ///
     pub fn incoming_msg(self) -> io::Result<BcmStream> {
@@ -494,28 +465,26 @@ impl BCMSocket {
 
     ///
     /// Stream of incoming frames that apply to the filter criteria.
-    /// ```
-    /// extern crate futures;
-    /// extern crate tokio;
-    /// extern crate socketcan;
-    ///
-    /// use futures::stream::Stream;
-    /// use tokio::prelude::*;
+    /// ```no_run
     /// use std::time;
     /// use tokio_socketcan_bcm::*;
+    /// use futures_util::stream::StreamExt;
     ///
-    /// let socket = BCMSocket::open_nb("vcan0").unwrap();
-    /// let ival = time::Duration::from_millis(1);
-    /// socket.filter_id(0x123.into(), ival, ival).unwrap();
-    /// let f = socket.incoming_frames()
-    ///        .map_err(|err| {
-    ///            eprintln!("IO error {:?}", err)
-    ///        })
-    ///       .for_each(|frame| {
-    ///          println!("Frame {:?}", frame);
-    ///          Ok(())
-    ///        });
-    /// tokio::run(f);
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let socket = BCMSocket::open_nb("vcan0").unwrap();
+    ///     let ival = time::Duration::from_millis(0);
+    ///
+    ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let mut can_frame_stream = socket
+    ///         .incoming_frames()
+    ///         .unwrap();
+    ///
+    ///     while let Some(frame) = can_frame_stream.next().await {
+    ///         println!("Frame {:?}", frame);
+    ///         ()
+    ///     }
+    /// }
     /// ```
     ///
     pub fn incoming_frames(self) -> io::Result<BcmFrameStream> {
@@ -712,7 +681,6 @@ impl From<u16> for CANMessageId {
     }
 }
 
-#[cfg(feature = "try_from")]
 impl TryFrom<u32> for CANMessageId {
     type Error = ConstructionError;
 
