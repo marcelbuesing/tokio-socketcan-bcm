@@ -15,7 +15,7 @@ futures = "0.3"
 futures-util = "0.3"
 libc = "0.2"
 mio = "0.7"
-nix = "0.18"
+nix = "0.20"
 socketcan = "1.7"
 tokio = { version = "1", features = ["net"] }
 
