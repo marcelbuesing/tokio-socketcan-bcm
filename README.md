@@ -26,7 +26,7 @@ async fn main() {
 
     // create a stream of messages that filters by the can frame id 0x123
     let mut can_frame_stream = socket
-        .filter_id_incoming_frames(0x123.into(), ival, ival)
+        .filter(0x123.into(), ival, ival)
         .unwrap();
 
     while let Some(frame) = can_frame_stream.next().await {

@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-bcm"
-version = "1.0.0"
+version = "2.0.0"
 authors = ["marcelbuesing <buesing.marcel@googlemail.com>"]
 license = "MIT"
 description = "Asynchronous Linux SocketCAN - Broadcast Manager support (BCM) with tokio"
@@ -14,7 +14,12 @@ bitflags = "1.2"
 futures = "0.3"
 futures-util = "0.3"
 libc = "0.2"
-mio = "0.6"
+mio = "0.7"
 nix = "0.18"
 socketcan = "1.7"
-tokio = { version = "0.2", features = ["net", "macros"] }
+tokio = { version = "1", features = ["net"] }
+
+[dev-dependencies.tokio]
+version = "*"
+# required for tokio::test
+features = ["macros", "rt-multi-thread"]

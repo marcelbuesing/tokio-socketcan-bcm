@@ -40,18 +40,20 @@ use core::convert::TryFrom;
 use futures::prelude::*;
 use futures::ready;
 use futures::task::Context;
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use mio::{unix::UnixReady, PollOpt, Ready, Token};
+use mio::{event, unix::SourceFd, Interest, Registry, Token};
+
 use nix::net::if_::if_nametoindex;
 use socketcan::{EFF_FLAG, EFF_MASK, SFF_MASK};
-use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
 use std::pin::Pin;
 use std::task::Poll;
+use std::{
+    fmt,
+    os::unix::prelude::{AsRawFd, RawFd},
+};
 use std::{io, slice, time};
-use tokio::io::PollEvented;
+use tokio::io::unix::AsyncFd;
 
 // reexport socketcan CANFrame
 pub use socketcan::CANFrame;
@@ -216,20 +218,13 @@ pub struct TxMsg {
     _frames: [CANFrame; MAX_NFRAMES as usize],
 }
 
-/// A socket for a CAN device, specifically for broadcast manager operations.
-#[derive(Debug)]
-pub struct BCMSocket {
-    pub fd: c_int,
-}
-
 pub struct BcmFrameStream {
-    io: PollEvented<BCMSocket>,
+    socket: BCMSocket,
 }
 
 impl BcmFrameStream {
     pub fn new(socket: BCMSocket) -> io::Result<BcmFrameStream> {
-        let io = PollEvented::new(socket)?;
-        Ok(BcmFrameStream { io })
+        Ok(BcmFrameStream { socket })
     }
 }
 
@@ -237,58 +232,53 @@ impl Stream for BcmFrameStream {
     type Item = io::Result<CANFrame>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let ready = Ready::readable();
+        loop {
+            let mut ready_guard = ready!(self.socket.fd.poll_read_ready(cx))?;
 
-        ready!(self
-            .io
-            .poll_read_ready(cx, Ready::readable() | UnixReady::error()))?;
-
-        match self.io.get_ref().read_msg() {
-            Ok(n) => {
-                if let Some(frame) = n.frames().iter().next() {
-                    Poll::Ready(Some(Ok(*frame)))
-                } else {
-                    // This happens e.g. when a timed out msg is received
-                    self.io.clear_read_ready(cx, ready)?;
-                    Poll::Pending
+            match ready_guard.try_io(|_inner| self.socket.read_msg()) {
+                Ok(Ok(msg_head)) => {
+                    if let Some(frame) = msg_head.frames().iter().next() {
+                        return Poll::Ready(Some(Ok(*frame)));
+                    } else {
+                        // This happens e.g. when a timed out msg is received
+                        return Poll::Pending;
+                    }
                 }
-            }
-            Err(err) => {
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(cx, ready)?;
-                    return Poll::Pending;
-                } else {
-                    Poll::Ready(Some(Err(err)))
-                }
+                Ok(Err(io_err)) => return Poll::Ready(Some(Err(io_err))),
+                Err(_would_block) => continue,
             }
         }
     }
 }
 
-impl Evented for BcmFrameStream {
+impl event::Source for BcmFrameStream {
     fn register(
-        &self,
-        poll: &mio::Poll,
+        &mut self,
+        registry: &Registry,
         token: Token,
-        interest: Ready,
-        opts: PollOpt,
+        interests: Interest,
     ) -> io::Result<()> {
-        self.io.get_ref().register(poll, token, interest, opts)
+        SourceFd(&self.socket.as_raw_fd()).register(registry, token, interests)
     }
 
     fn reregister(
-        &self,
-        poll: &mio::Poll,
+        &mut self,
+        registry: &Registry,
         token: Token,
-        interest: Ready,
-        opts: PollOpt,
+        interests: Interest,
     ) -> io::Result<()> {
-        self.io.get_ref().reregister(poll, token, interest, opts)
+        SourceFd(&self.socket.as_raw_fd()).reregister(registry, token, interests)
     }
 
-    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
-        self.io.get_ref().deregister(poll)
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        SourceFd(&self.socket.as_raw_fd()).deregister(registry)
     }
+}
+
+/// A socket for a CAN device, specifically for broadcast manager operations.
+#[derive(Debug)]
+pub struct BCMSocket {
+    pub(crate) fd: AsyncFd<c_int>,
 }
 
 impl BCMSocket {
@@ -349,12 +339,14 @@ impl BCMSocket {
             return Err(io::Error::last_os_error());
         }
 
+        let sock_fd = AsyncFd::new(sock_fd)?;
+
         Ok(BCMSocket { fd: sock_fd })
     }
 
     fn close(&mut self) -> io::Result<()> {
         unsafe {
-            let rv = close(self.fd);
+            let rv = close(self.fd.as_raw_fd());
             if rv != -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -362,8 +354,76 @@ impl BCMSocket {
         Ok(())
     }
 
+    ///
+    /// Filter CAN frames by CAN identifier.
+    /// ```no_run
+    /// use std::time;
+    /// use tokio_socketcan_bcm::*;
+    /// use futures_util::stream::StreamExt;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let socket = BCMSocket::open_nb("vcan0").unwrap();
+    ///     let ival = time::Duration::from_millis(0);
+    ///
+    ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let mut can_frame_stream = socket
+    ///         .filter(0x123.into(), ival, ival)
+    ///         .unwrap();
+    ///
+    ///     while let Some(frame) = can_frame_stream.next().await {
+    ///         println!("Frame {:?}", frame);
+    ///         ()
+    ///     }
+    /// }
+    /// ```
+    ///
+    pub fn filter(
+        self,
+        can_id: CANMessageId,
+        ival1: time::Duration,
+        ival2: time::Duration,
+    ) -> io::Result<impl Stream<Item = io::Result<CANFrame>>> {
+        self.filter_id_internal(can_id, ival1, ival2)?;
+        BcmFrameStream::new(self)
+    }
+
+    ///
+    /// Stream of incoming `BcmMsgHead` that apply to the filter criteria.
+    /// ```no_run
+    /// use std::time;
+    /// use tokio_socketcan_bcm::*;
+    /// use futures_util::stream::StreamExt;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let socket = BCMSocket::open_nb("vcan0").unwrap();
+    ///     let ival = time::Duration::from_millis(0);
+    ///
+    ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let mut can_frame_stream = socket
+    ///         .incoming_msg()
+    ///         .unwrap();
+    ///
+    ///     while let Some(frame) = can_frame_stream.next().await {
+    ///         println!("Frame {:?}", frame);
+    ///         ()
+    ///     }
+    /// }
+    /// ```
+    ///
+    pub fn filter_message(
+        self,
+        can_id: CANMessageId,
+        ival1: time::Duration,
+        ival2: time::Duration,
+    ) -> io::Result<impl Stream<Item = io::Result<BcmMsgHead>>> {
+        self.filter_id_internal(can_id, ival1, ival2)?;
+        BcmStream::from(self)
+    }
+
     /// Create a content filter subscription, filtering can frames by can_id.
-    pub fn filter_id(
+    fn filter_id_internal(
         &self,
         can_id: CANMessageId,
         ival1: time::Duration,
@@ -392,13 +452,33 @@ impl BCMSocket {
 
         let tx_msg_ptr = tx_msg as *const TxMsg;
 
-        let write_rv = unsafe { write(self.fd, tx_msg_ptr as *const c_void, size_of::<TxMsg>()) };
+        let write_rv = unsafe {
+            write(
+                self.fd.as_raw_fd(),
+                tx_msg_ptr as *const c_void,
+                size_of::<TxMsg>(),
+            )
+        };
 
         if write_rv < 0 {
             return Err(Error::new(ErrorKind::WriteZero, io::Error::last_os_error()));
         }
 
         Ok(())
+    }
+
+    /// Create a content filter subscription, filtering can frames by can_id.
+    #[deprecated(
+        since = "2.0.0",
+        note = "Will be removed in the future. Please use the `filter` function instead"
+    )]
+    pub fn filter_id(
+        &self,
+        can_id: CANMessageId,
+        ival1: time::Duration,
+        ival2: time::Duration,
+    ) -> io::Result<()> {
+        self.filter_id_internal(can_id, ival1, ival2)
     }
 
     ///
@@ -425,14 +505,17 @@ impl BCMSocket {
     /// }
     /// ```
     ///
+    #[deprecated(
+        since = "2.0.0",
+        note = "Renamed, please use the `filter` function instead"
+    )]
     pub fn filter_id_incoming_frames(
         self,
         can_id: CANMessageId,
         ival1: time::Duration,
         ival2: time::Duration,
-    ) -> io::Result<BcmFrameStream> {
-        self.filter_id(can_id, ival1, ival2)?;
-        self.incoming_frames()
+    ) -> io::Result<impl Stream<Item = io::Result<CANFrame>>> {
+        self.filter(can_id, ival1, ival2)
     }
 
     ///
@@ -459,7 +542,11 @@ impl BCMSocket {
     /// }
     /// ```
     ///
-    pub fn incoming_msg(self) -> io::Result<BcmStream> {
+    #[deprecated(
+        since = "2.0.0",
+        note = "Please use the `filter_message` function instead"
+    )]
+    pub fn incoming_msg(self) -> io::Result<impl Stream<Item = io::Result<BcmMsgHead>>> {
         BcmStream::from(self)
     }
 
@@ -487,11 +574,13 @@ impl BCMSocket {
     /// }
     /// ```
     ///
-    pub fn incoming_frames(self) -> io::Result<BcmFrameStream> {
+    #[deprecated(since = "2.0.0", note = "Please use the `filter` function instead")]
+    pub fn incoming_frames(self) -> io::Result<impl Stream<Item = io::Result<CANFrame>>> {
         BcmFrameStream::new(self)
     }
 
     /// Remove a content filter subscription.
+    #[deprecated(since = "2.0.0", note = "Will be removed in future versions.")]
     pub fn filter_delete(&self, can_id: CANMessageId) -> io::Result<()> {
         let frames = [CANFrame::new(0x0, &[], false, false).unwrap(); MAX_NFRAMES as usize];
 
@@ -509,7 +598,13 @@ impl BCMSocket {
         };
 
         let msg_ptr = msg as *const BcmMsgHead;
-        let write_rv = unsafe { write(self.fd, msg_ptr as *const c_void, size_of::<BcmMsgHead>()) };
+        let write_rv = unsafe {
+            write(
+                self.fd.as_raw_fd(),
+                msg_ptr as *const c_void,
+                size_of::<BcmMsgHead>(),
+            )
+        };
 
         let expected_size = size_of::<BcmMsgHead>() - size_of::<[CANFrame; MAX_NFRAMES as usize]>();
         if write_rv as usize != expected_size {
@@ -521,7 +616,7 @@ impl BCMSocket {
     }
 
     /// Read a single bcm message.
-    pub fn read_msg(&self) -> io::Result<BcmMsgHead> {
+    fn read_msg(&self) -> io::Result<BcmMsgHead> {
         let ival1 = c_timeval_new(time::Duration::from_millis(0));
         let ival2 = c_timeval_new(time::Duration::from_millis(0));
         let frames = [CANFrame::new(0x0, &[], false, false).unwrap(); MAX_NFRAMES as usize];
@@ -539,7 +634,13 @@ impl BCMSocket {
         };
 
         let msg_ptr = &mut msg as *mut BcmMsgHead;
-        let count = unsafe { read(self.fd, msg_ptr as *mut c_void, size_of::<BcmMsgHead>()) };
+        let count = unsafe {
+            read(
+                self.fd.as_raw_fd(),
+                msg_ptr as *mut c_void,
+                size_of::<BcmMsgHead>(),
+            )
+        };
 
         let last_error = io::Error::last_os_error();
         if count < 0 {
@@ -550,29 +651,33 @@ impl BCMSocket {
     }
 }
 
-impl Evented for BCMSocket {
+impl AsRawFd for BCMSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl event::Source for BCMSocket {
     fn register(
-        &self,
-        poll: &mio::Poll,
+        &mut self,
+        registry: &Registry,
         token: Token,
-        interest: Ready,
-        opts: PollOpt,
+        interests: Interest,
     ) -> io::Result<()> {
-        EventedFd(&self.fd).register(poll, token, interest, opts)
+        SourceFd(&self.fd.as_raw_fd()).register(registry, token, interests)
     }
 
     fn reregister(
-        &self,
-        poll: &mio::Poll,
+        &mut self,
+        registry: &Registry,
         token: Token,
-        interest: Ready,
-        opts: PollOpt,
+        interests: Interest,
     ) -> io::Result<()> {
-        EventedFd(&self.fd).reregister(poll, token, interest, opts)
+        SourceFd(&self.fd.as_raw_fd()).reregister(registry, token, interests)
     }
 
-    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
-        EventedFd(&self.fd).deregister(poll)
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        SourceFd(&self.fd.as_raw_fd()).deregister(registry)
     }
 }
 
@@ -583,7 +688,7 @@ impl Drop for BCMSocket {
 }
 
 pub struct BcmStream {
-    io: PollEvented<BCMSocket>,
+    socket: BCMSocket,
 }
 
 pub trait IntoBcmStream {
@@ -594,9 +699,8 @@ pub trait IntoBcmStream {
 }
 
 impl BcmStream {
-    pub fn from(bcm_socket: BCMSocket) -> io::Result<BcmStream> {
-        let io = PollEvented::new(bcm_socket)?;
-        Ok(BcmStream { io })
+    pub fn from(socket: BCMSocket) -> io::Result<BcmStream> {
+        Ok(BcmStream { socket })
     }
 }
 
@@ -604,19 +708,11 @@ impl Stream for BcmStream {
     type Item = io::Result<BcmMsgHead>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        ready!(self
-            .io
-            .poll_read_ready(cx, Ready::readable() | UnixReady::error()))?;
-
-        match self.io.get_ref().read_msg() {
-            Ok(msg) => Poll::Ready(Some(Ok(msg))),
-            Err(err) => {
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(cx, Ready::readable())?;
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Some(Err(err)))
-                }
+        loop {
+            let mut ready_guard = ready!(self.socket.fd.poll_read_ready(cx))?;
+            match ready_guard.try_io(|_inner| self.socket.read_msg()) {
+                Ok(result) => return Poll::Ready(Some(result)),
+                Err(_would_block) => continue,
             }
         }
     }
