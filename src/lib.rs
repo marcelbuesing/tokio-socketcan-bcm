@@ -19,8 +19,9 @@
 //!     let ival = time::Duration::from_millis(0);
 //!
 //!     // create a stream of messages that filters by the can frame id 0x123
+//!     let id = Id::Standard(StandardId::new(0x123).unwrap());
 //!     let mut can_frame_stream = socket
-//!         .filter_id_incoming_frames(0x123.into(), ival, ival)
+//!         .filter(id, ival, ival)
 //!         .unwrap();
 //!
 //!     while let Some(frame) = can_frame_stream.next().await {
@@ -30,20 +31,17 @@
 //! }
 //! ```
 
+use bitflags::bitflags;
+pub use embedded_can::{ExtendedId, Id, StandardId};
+use futures::prelude::*;
+use futures::ready;
+use futures::task::Context;
 use libc::{
     c_int, c_short, c_uint, c_void, close, connect, fcntl, read, sockaddr, socket, suseconds_t,
     time_t, timeval, write, F_SETFL, O_NONBLOCK,
 };
-
-use bitflags::bitflags;
-use core::convert::TryFrom;
-use futures::prelude::*;
-use futures::ready;
-use futures::task::Context;
 use mio::{event, unix::SourceFd, Interest, Registry, Token};
-
 use nix::net::if_::if_nametoindex;
-use socketcan::{EFF_FLAG, EFF_MASK, SFF_MASK};
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
 use std::pin::Pin;
@@ -58,19 +56,6 @@ use tokio::io::unix::AsyncFd;
 // reexport socketcan CANFrame
 pub use socketcan::CANFrame;
 
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use std::convert::TryFrom;
-
-    #[test]
-    fn eff_with_eff_bit_is_stripped_of_bit() {
-        let can_id = CANMessageId::try_from(0x98FE_F5EBu32);
-        assert_eq!(Ok(CANMessageId::EFF(0x18FE_F5EB)), can_id);
-    }
-}
-
 /// defined in socket.h
 pub const AF_CAN: c_int = 29;
 /// defined in socket.h
@@ -80,8 +65,6 @@ pub const CAN_BCM: c_int = 2;
 
 /// datagram (connection less) socket
 pub const SOCK_DGRAM: c_int = 2;
-
-const SFF_MASK_U16: u16 = 0x07ff;
 
 pub const MAX_NFRAMES: u32 = 256;
 
@@ -367,8 +350,9 @@ impl BCMSocket {
     ///     let ival = time::Duration::from_millis(0);
     ///
     ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let id = Id::Standard(StandardId::new(0x123).unwrap());
     ///     let mut can_frame_stream = socket
-    ///         .filter(0x123.into(), ival, ival)
+    ///         .filter(id, ival, ival)
     ///         .unwrap();
     ///
     ///     while let Some(frame) = can_frame_stream.next().await {
@@ -380,7 +364,7 @@ impl BCMSocket {
     ///
     pub fn filter(
         self,
-        can_id: CANMessageId,
+        can_id: Id,
         ival1: time::Duration,
         ival2: time::Duration,
     ) -> io::Result<impl Stream<Item = io::Result<CANFrame>>> {
@@ -414,7 +398,7 @@ impl BCMSocket {
     ///
     pub fn filter_message(
         self,
-        can_id: CANMessageId,
+        can_id: Id,
         ival1: time::Duration,
         ival2: time::Duration,
     ) -> io::Result<impl Stream<Item = io::Result<BcmMsgHead>>> {
@@ -425,7 +409,7 @@ impl BCMSocket {
     /// Create a content filter subscription, filtering can frames by can_id.
     fn filter_id_internal(
         &self,
-        can_id: CANMessageId,
+        can_id: Id,
         ival1: time::Duration,
         ival2: time::Duration,
     ) -> io::Result<()> {
@@ -433,6 +417,11 @@ impl BCMSocket {
         let _ival2 = c_timeval_new(ival2);
 
         let frames = [CANFrame::new(0x0, &[], false, false).unwrap(); MAX_NFRAMES as usize];
+        let can_id = match can_id {
+            Id::Standard(sid) => sid.as_raw().into(),
+            Id::Extended(eid) => eid.as_raw() | FrameFlags::EFF_FLAG.bits(),
+        };
+
         let msg = BcmMsgHeadFrameLess {
             _opcode: RX_SETUP,
             _flags: SETTIMER | RX_FILTER_ID,
@@ -441,7 +430,7 @@ impl BCMSocket {
             _pad: 0,
             _ival1,
             _ival2,
-            _can_id: can_id.with_eff_bit(),
+            _can_id: can_id,
             _nframes: 0,
         };
 
@@ -474,7 +463,7 @@ impl BCMSocket {
     )]
     pub fn filter_id(
         &self,
-        can_id: CANMessageId,
+        can_id: Id,
         ival1: time::Duration,
         ival2: time::Duration,
     ) -> io::Result<()> {
@@ -494,8 +483,9 @@ impl BCMSocket {
     ///     let ival = time::Duration::from_millis(0);
     ///
     ///     // create a stream of messages that filters by the can frame id 0x123
+    ///     let id = Id::Standard(StandardId::new(0x123).unwrap());
     ///     let mut can_frame_stream = socket
-    ///         .filter_id_incoming_frames(0x123.into(), ival, ival)
+    ///         .filter_id_incoming_frames(id, ival, ival)
     ///         .unwrap();
     ///
     ///     while let Some(frame) = can_frame_stream.next().await {
@@ -511,7 +501,7 @@ impl BCMSocket {
     )]
     pub fn filter_id_incoming_frames(
         self,
-        can_id: CANMessageId,
+        can_id: Id,
         ival1: time::Duration,
         ival2: time::Duration,
     ) -> io::Result<impl Stream<Item = io::Result<CANFrame>>> {
@@ -581,8 +571,13 @@ impl BCMSocket {
 
     /// Remove a content filter subscription.
     #[deprecated(since = "2.0.0", note = "Will be removed in future versions.")]
-    pub fn filter_delete(&self, can_id: CANMessageId) -> io::Result<()> {
+    pub fn filter_delete(&self, can_id: Id) -> io::Result<()> {
         let frames = [CANFrame::new(0x0, &[], false, false).unwrap(); MAX_NFRAMES as usize];
+
+        let can_id = match can_id {
+            Id::Standard(sid) => sid.as_raw().into(),
+            Id::Extended(eid) => eid.as_raw() | FrameFlags::EFF_FLAG.bits(),
+        };
 
         let msg = &BcmMsgHead {
             _opcode: RX_DELETE,
@@ -590,7 +585,7 @@ impl BCMSocket {
             _count: 0,
             _ival1: c_timeval_new(time::Duration::new(0, 0)),
             _ival2: c_timeval_new(time::Duration::new(0, 0)),
-            _can_id: can_id.with_eff_bit(),
+            _can_id: can_id,
             _nframes: 0,
             #[cfg(all(target_pointer_width = "32"))]
             _pad: 0,
@@ -739,94 +734,6 @@ pub struct CANAddr {
     pub if_index: c_int, // address familiy,
     pub rx_id: u32,
     pub tx_id: u32,
-}
-
-/// 11-bit or 29-bit identifier of can frame.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Hash)]
-pub enum CANMessageId {
-    /// Standard Frame Format (11-bit identifier)
-    SFF(u16),
-    /// Extended Frame Format (29-bit identifier)
-    EFF(u32),
-}
-
-impl fmt::Display for CANMessageId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            CANMessageId::SFF(id) => write!(f, "{}", id),
-            CANMessageId::EFF(id) => write!(f, "{}", id),
-        }
-    }
-}
-
-impl CANMessageId {
-    pub fn with_eff_bit(self) -> u32 {
-        match self {
-            CANMessageId::SFF(id) => u32::from(id),
-            CANMessageId::EFF(id) => id | FrameFlags::EFF_FLAG.bits(),
-        }
-    }
-}
-
-impl From<u16> for CANMessageId {
-    fn from(id: u16) -> CANMessageId {
-        match id {
-            0..=SFF_MASK_U16 => CANMessageId::SFF(id),
-            SFF_MASK_U16..=std::u16::MAX => CANMessageId::EFF(u32::from(id)),
-        }
-    }
-}
-
-impl TryFrom<u32> for CANMessageId {
-    type Error = ConstructionError;
-
-    fn try_from(id: u32) -> Result<CANMessageId, ConstructionError> {
-        match id {
-            0...SFF_MASK => Ok(CANMessageId::SFF(id as u16)),
-            SFF_MASK...EFF_MASK => Ok(CANMessageId::EFF(id)),
-            _ => {
-                // might be the EFF flag is set
-                if id & EFF_FLAG != 0 {
-                    let without_flag = id & EFF_MASK;
-                    Ok(CANMessageId::EFF(without_flag))
-                } else {
-                    Err(ConstructionError::IDTooLarge)
-                }
-            }
-        }
-    }
-}
-
-impl From<CANMessageId> for u32 {
-    fn from(id: CANMessageId) -> u32 {
-        match id {
-            CANMessageId::SFF(id) => u32::from(id),
-            CANMessageId::EFF(id) => id,
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-/// Error that occurs when creating CAN packets
-pub enum ConstructionError {
-    /// CAN ID was outside the range of valid IDs
-    IDTooLarge,
-}
-
-impl fmt::Display for ConstructionError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ConstructionError::IDTooLarge => write!(f, "CAN ID too large"),
-        }
-    }
-}
-
-impl std::error::Error for ConstructionError {
-    fn description(&self) -> &str {
-        match *self {
-            ConstructionError::IDTooLarge => "can id too large",
-        }
-    }
 }
 
 fn c_timeval_new(t: time::Duration) -> timeval {
